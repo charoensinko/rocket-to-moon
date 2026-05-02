@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rocket to the Moon</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #000;
+    font-family: 'Courier New', monospace;
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+  }
+
+  #canvas { display: block; width: 100%; height: 100%; }
+
+  #hud {
+    position: fixed;
+    top: 20px;
+    left: 20px;
+    color: #00ff88;
+    font-size: 13px;
+    line-height: 1.8;
+    text-shadow: 0 0 8px #00ff88;
+    pointer-events: none;
+    z-index: 10;
+  }
+  #hud .label { color: #888; }
+  #hud .value { color: #00ff88; }
+
+  #fuel-bar-container {
+    width: 160px; height: 10px;
+    background: #111;
+    border: 1px solid #00ff88;
+    border-radius: 3px;
+    margin-top: 3px;
+    display: inline-block;
+    vertical-align: middle;
+  }
+  #fuel-bar {
+    height: 100%;
+    background: linear-gradient(90deg, #ff4400, #ffaa00, #00ff88);
+    border-radius: 3px;
+    transition: width 0.2s;
+    width: 100%;
+  }
+
+  #controls {
+    position: fixed;
+    bottom: 30px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 16px;
+    z-index: 10;
+  }
+
+  button {
+    padding: 12px 28px;
+    border: 2px solid #00ff88;
+    background: rgba(0,255,136,0.1);
+    color: #00ff88;
+    font-family: 'Courier New', monospace;
+    font-size: 14px;
+    cursor: pointer;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    transition: all 0.2s;
+  }
+  button:hover:not(:disabled) {
+    background: rgba(0,255,136,0.25);
+    box-shadow: 0 0 16px rgba(0,255,136,0.4);
+  }
+  button:disabled { opacity: 0.3; cursor: not-allowed; }
+  #btn-return { border-color: #ffaa00; color: #ffaa00; background: rgba(255,170,0,0.1); }
+  #btn-return:hover:not(:disabled) {
+    background: rgba(255,170,0,0.25);
+    box-shadow: 0 0 16px rgba(255,170,0,0.4);
+  }
+
+  #message {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    color: #fff;
+    font-size: 28px;
+    font-family: 'Courier New', monospace;
+    text-align: center;
+    text-shadow: 0 0 20px #fff;
+    z-index: 20;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.5s;
+  }
+
+  #phase-indicator {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    color: #ffaa00;
+    font-size: 12px;
+    text-align: right;
+    text-shadow: 0 0 8px #ffaa00;
+    z-index: 10;
+  }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+
+<div id="hud">
+  <div><span class="label">ALTITUDE  : </span><span class="value" id="hud-alt">0</span><span class="label"> km</span></div>
+  <div><span class="label">VELOCITY  : </span><span class="value" id="hud-vel">0</span><span class="label"> m/s</span></div>
+  <div><span class="label">ACCEL     : </span><span class="value" id="hud-acc">0</span><span class="label"> m/s²</span></div>
+  <div><span class="label">DISTANCE  : </span><span class="value" id="hud-dist">384,400</span><span class="label" id="hud-dist-label"> km to Moon</span></div>
+  <div style="margin-top:6px"><span class="label">FUEL      : </span><div id="fuel-bar-container"><div id="fuel-bar"></div></div></div>
+  <div><span class="label">FUEL %    : </span><span class="value" id="hud-fuel">100%</span></div>
+</div>
+
+<div id="phase-indicator">
+  <div id="phase-text">READY FOR LAUNCH</div>
+  <div id="mission-time">T+00:00:00</div>
+</div>
+
+<div id="message"></div>
+
+<div id="controls">
+  <button id="btn-launch">LAUNCH</button>
+  <button id="btn-return" disabled>RETURN TO EARTH</button>
+  <button id="btn-reset">RESET</button>
+</div>
+
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }
+resize();
+window.addEventListener('resize', resize);
+
+// --- Stars ---
+const stars = Array.from({ length: 300 }, () => ({
+  x: Math.random(), y: Math.random(),
+  r: Math.random() * 1.5 + 0.2,
+  twinkle: Math.random() * Math.PI * 2
+}));
+
+// --- Constants ---
+const MOON_DIST_KM    = 384400;
+const EARTH_RADIUS_KM = 6371;
+const TIME_SCALE      = 100;
+const THRUST_ACCEL    = 60;
+const GRAVITY_SURFACE = 9.8;
+const GRAVITY_FALLOFF = 2;
+const FUEL_BURN_RATE  = 0.0006;   // ~17 real-sec burn
+const BRAKE_START_KM  = 200000;   // km — start decel burn (both directions)
+
+let sim = {};
+
+function resetSim() {
+  sim = {
+    phase: 'ready',
+    // ready | launch | ascent | coast | approach | landed
+    // return_launch | return_coast | return_approach | earth_landed | failed
+    t: 0,
+    altKm: 0,
+    velMs: 0,
+    accMs2: 0,
+    fuel: 1.0,
+    returnFuel: 1.0,
+    direction: 1,       // 1 = toward Moon, -1 = toward Earth
+    moonVisited: false,
+    thrustOn: false,
+    earthRotation: 0,
+    moonRotation: 0,
+    orbitPhase: 0,
+    particles: [],
+  };
+  updateHUD();
+  setPhaseText('READY FOR LAUNCH');
+  document.getElementById('btn-launch').disabled = false;
+  document.getElementById('btn-return').disabled = true;
+  hideMessage();
+}
+resetSim();
+
+function gravity(altKm) {
+  const d = EARTH_RADIUS_KM + altKm;
+  return GRAVITY_SURFACE * (EARTH_RADIUS_KM / d) ** GRAVITY_FALLOFF;
+}
+
+function stepPhysics(dt) {
+  const stopped = ['ready','landed','earth_landed','failed'];
+  if (stopped.includes(sim.phase)) return;
+
+  sim.t += dt;
+  const s = dt * TIME_SCALE;  // sim-seconds per real frame
+
+  // ── Going to Moon ──────────────────────────────────────────────
+  if (sim.phase === 'launch' || sim.phase === 'ascent') {
+    if (sim.fuel > 0) {
+      sim.thrustOn = true;
+      sim.accMs2 = THRUST_ACCEL;
+      sim.velMs += sim.accMs2 * s;
+      sim.fuel = Math.max(0, sim.fuel - FUEL_BURN_RATE * s);
+      if (sim.fuel === 0) { sim.thrustOn = false; sim.phase = 'coast'; }
+      if (sim.altKm > 200) sim.phase = 'ascent';
+    } else {
+      sim.thrustOn = false; sim.phase = 'coast';
+    }
+  }
+
+  if (sim.phase === 'coast') {
+    sim.thrustOn = false;
+    sim.accMs2 = -gravity(sim.altKm);
+    sim.velMs += sim.accMs2 * s;
+    if (MOON_DIST_KM - sim.altKm < BRAKE_START_KM) sim.phase = 'approach';
+    if (sim.velMs < 0 && sim.altKm < 100) {
+      sim.phase = 'failed'; sim.thrustOn = false;
+      showMessage('MISSION FAILED\nRocket fell back to Earth');
+      setPhaseText('MISSION FAILED'); return;
+    }
+  }
+
+  if (sim.phase === 'approach') {
+    if (sim.fuel > 0 && sim.velMs > 500) {
+      sim.thrustOn = true;
+      sim.accMs2 = -THRUST_ACCEL * 0.5;
+      sim.velMs += sim.accMs2 * s;
+      sim.fuel = Math.max(0, sim.fuel - FUEL_BURN_RATE * 0.3 * s);
+    } else {
+      sim.thrustOn = false;
+      sim.accMs2 = 0.1;
+      sim.velMs = Math.max(100, sim.velMs + sim.accMs2 * s);
+    }
+    if (sim.altKm >= MOON_DIST_KM - 10) {
+      sim.altKm = MOON_DIST_KM; sim.velMs = 0; sim.thrustOn = false;
+      sim.phase = 'landed'; sim.moonVisited = true;
+      showMessage('MISSION SUCCESS!\nEagle has landed on the Moon!');
+      setPhaseText('LANDED ON MOON');
+      document.getElementById('btn-return').disabled = false;
+    }
+  }
+
+  // ── Returning to Earth ─────────────────────────────────────────
+  if (sim.phase === 'return_launch') {
+    if (sim.returnFuel > 0) {
+      sim.thrustOn = true;
+      sim.accMs2 = THRUST_ACCEL;
+      sim.velMs += sim.accMs2 * s;
+      sim.returnFuel = Math.max(0, sim.returnFuel - FUEL_BURN_RATE * s);
+      if (sim.returnFuel === 0) { sim.thrustOn = false; sim.phase = 'return_coast'; }
+    } else {
+      sim.thrustOn = false; sim.phase = 'return_coast';
+    }
+  }
+
+  if (sim.phase === 'return_coast') {
+    sim.thrustOn = false;
+    // Earth gravity accelerates rocket as it gets closer
+    sim.accMs2 = gravity(sim.altKm);
+    sim.velMs += sim.accMs2 * s;
+    if (sim.altKm < BRAKE_START_KM) sim.phase = 'return_approach';
+  }
+
+  if (sim.phase === 'return_approach') {
+    if (sim.returnFuel > 0 && sim.velMs > 1000) {
+      sim.thrustOn = true;
+      sim.accMs2 = -THRUST_ACCEL * 0.5;
+      sim.velMs += sim.accMs2 * s;
+      sim.returnFuel = Math.max(0, sim.returnFuel - FUEL_BURN_RATE * 0.3 * s);
+    } else {
+      sim.thrustOn = false;
+      sim.accMs2 = gravity(sim.altKm) * 0.2;
+      sim.velMs = Math.max(200, sim.velMs + sim.accMs2 * s);
+    }
+    if (sim.altKm <= 10) {
+      sim.altKm = 0; sim.velMs = 0; sim.thrustOn = false;
+      sim.phase = 'earth_landed';
+      showMessage('WELCOME HOME!\nRocket safely returned to Earth!');
+      setPhaseText('RETURNED TO EARTH');
+      document.getElementById('btn-return').disabled = true;
+    }
+  }
+
+  // ── Altitude update ────────────────────────────────────────────
+  sim.altKm += (sim.velMs * s / 1000) * sim.direction;
+  sim.altKm = Math.max(0, sim.altKm);
+  if (sim.direction === 1)  sim.altKm = Math.min(sim.altKm, MOON_DIST_KM);
+  if (sim.direction === -1) sim.altKm = Math.max(0, sim.altKm);
+
+  if (sim.thrustOn) for (let i = 0; i < 4; i++) spawnParticle();
+  updateParticles(dt);
+  updateHUD();
+}
+
+// --- Particles ---
+function spawnParticle() {
+  const pos = getRocketScreenPos();
+  // Engine is at bottom when going up, at top when returning
+  const engineY = sim.direction === 1
+    ? pos.y + pos.h * 0.55
+    : pos.y - pos.h * 0.05;
+  const vyDir = sim.direction === 1 ? 1 : -1;
+  sim.particles.push({
+    x: pos.x + (Math.random() - 0.5) * 8,
+    y: engineY + Math.random() * 8 * vyDir,
+    vx: (Math.random() - 0.5) * 60,
+    vy: (Math.random() * 120 + 40) * vyDir,
+    life: 1.0,
+    size: Math.random() * 5 + 2,
+    color: Math.random() < 0.5 ? '#ff6600' : '#ffcc00'
+  });
+}
+
+function updateParticles(dt) {
+  sim.particles = sim.particles.filter(p => p.life > 0);
+  for (const p of sim.particles) {
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += 30 * dt * sim.direction;
+    p.life -= dt * 2.5;
+  }
+}
+
+// --- Rocket screen position ---
+function getRocketScreenPos() {
+  const progress = Math.min(sim.altKm / MOON_DIST_KM, 1);
+  const startY = H * 0.82, endY = H * 0.14;
+  const y = startY - (startY - endY) * easeInOut(progress);
+  return { x: W / 2, y: y - 30, w: 20, h: 60 };
+}
+
+function easeInOut(t) {
+  return t < 0.5 ? 2*t*t : -1 + (4 - 2*t)*t;
+}
+
+// --- HUD ---
+function updateHUD() {
+  document.getElementById('hud-alt').textContent = Math.round(sim.altKm).toLocaleString();
+  document.getElementById('hud-vel').textContent = Math.round(sim.velMs).toLocaleString();
+  document.getElementById('hud-acc').textContent = sim.accMs2.toFixed(1);
+
+  if (sim.direction === 1) {
+    const d = Math.max(0, MOON_DIST_KM - sim.altKm);
+    document.getElementById('hud-dist').textContent = Math.round(d).toLocaleString();
+    document.getElementById('hud-dist-label').textContent = ' km to Moon';
+  } else {
+    document.getElementById('hud-dist').textContent = Math.round(sim.altKm).toLocaleString();
+    document.getElementById('hud-dist-label').textContent = ' km to Earth';
+  }
+
+  const fuelPct = sim.direction === 1
+    ? sim.fuel
+    : sim.returnFuel;
+  document.getElementById('hud-fuel').textContent = Math.round(fuelPct * 100) + '%';
+  document.getElementById('fuel-bar').style.width = (fuelPct * 100) + '%';
+}
+
+function setPhaseText(txt) { document.getElementById('phase-text').textContent = txt; }
+
+function updatePhaseText() {
+  const labels = {
+    ready: 'READY FOR LAUNCH', launch: 'MAIN ENGINE START',
+    ascent: 'ASCENDING', coast: 'COAST PHASE',
+    approach: 'LUNAR APPROACH BURN', landed: 'LANDED ON MOON',
+    return_launch: 'RETURN LAUNCH', return_coast: 'RETURN COAST',
+    return_approach: 'EARTH APPROACH BURN', earth_landed: 'RETURNED TO EARTH',
+    failed: 'MISSION FAILED',
+  };
+  const lbl = labels[sim.phase];
+  if (lbl && sim.phase !== 'landed' && sim.phase !== 'earth_landed' && sim.phase !== 'failed') {
+    setPhaseText(lbl);
+  }
+}
+
+function updateMissionTime() {
+  const s = Math.floor(sim.t);
+  const hh = String(Math.floor(s/3600)).padStart(2,'0');
+  const mm = String(Math.floor((s%3600)/60)).padStart(2,'0');
+  const ss = String(s%60).padStart(2,'0');
+  document.getElementById('mission-time').textContent = `T+${hh}:${mm}:${ss}`;
+}
+
+function showMessage(txt) {
+  const el = document.getElementById('message');
+  el.innerHTML = txt.replace('\n','<br>');
+  el.style.opacity = '1';
+}
+function hideMessage() { document.getElementById('message').style.opacity = '0'; }
+
+// --- Drawing ---
+function drawBackground() {
+  const progress = sim.altKm / MOON_DIST_KM;
+  const bg = ctx.createLinearGradient(0, H, 0, 0);
+  if (progress < 0.17) {
+    const a = Math.max(0, 1 - progress * 6);
+    bg.addColorStop(0, `rgba(5,10,30,${a})`);
+    bg.addColorStop(0.3, `rgba(3,6,18,${Math.max(0, a*0.8)})`);
+    bg.addColorStop(1, '#000008');
+  } else {
+    bg.addColorStop(0, '#000');
+    bg.addColorStop(1, '#000');
+  }
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function drawStars(t) {
+  ctx.save();
+  for (const s of stars) {
+    ctx.globalAlpha = 0.6 + 0.4 * Math.sin(s.twinkle + t * 1.5);
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(s.x * W, s.y * H, s.r, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawEarth() {
+  const cx = W/2, cy = H + 60;
+  const r = Math.min(W,H) * 0.38;
+
+  const glow = ctx.createRadialGradient(cx, cy, r*0.8, cx, cy, r*1.3);
+  glow.addColorStop(0, 'rgba(50,120,255,0.18)');
+  glow.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.beginPath(); ctx.arc(cx, cy, r*1.3, 0, Math.PI*2);
+  ctx.fillStyle = glow; ctx.fill();
+
+  const grad = ctx.createRadialGradient(cx-r*0.3, cy-r*0.3, r*0.1, cx, cy, r);
+  grad.addColorStop(0, '#5599ff'); grad.addColorStop(0.4, '#2255cc');
+  grad.addColorStop(0.7, '#1a3a8a'); grad.addColorStop(1, '#0a1a4a');
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2);
+  ctx.fillStyle = grad; ctx.fill();
+
+  ctx.save();
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.clip();
+  ctx.fillStyle = 'rgba(40,160,60,0.65)';
+  for (const [bx,by,bw,bh] of [
+    [cx-r*.25,cy-r*.2,r*.22,r*.18],[cx+r*.15,cy-r*.1,r*.18,r*.22],
+    [cx-r*.1,cy+r*.15,r*.25,r*.12],[cx+r*.35,cy+r*.2,r*.12,r*.15],
+    [cx-r*.45,cy+r*.05,r*.10,r*.20]
+  ]) { ctx.beginPath(); ctx.ellipse(bx,by,bw,bh,sim.earthRotation*0.3,0,Math.PI*2); ctx.fill(); }
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  for (const [bx,by,bw,bh] of [
+    [cx-r*.1,cy-r*.35,r*.3,r*.07],[cx+r*.2,cy-r*.15,r*.25,r*.06],[cx-r*.3,cy+r*.1,r*.2,r*.05]
+  ]) { ctx.beginPath(); ctx.ellipse(bx,by,bw,bh,0,0,Math.PI*2); ctx.fill(); }
+  ctx.restore();
+
+  const atmo = ctx.createRadialGradient(cx, cy, r*0.92, cx, cy, r*1.08);
+  atmo.addColorStop(0, 'rgba(100,180,255,0.0)');
+  atmo.addColorStop(0.5, 'rgba(100,180,255,0.28)');
+  atmo.addColorStop(1, 'rgba(100,180,255,0.0)');
+  ctx.beginPath(); ctx.arc(cx, cy, r*1.08, 0, Math.PI*2);
+  ctx.fillStyle = atmo; ctx.fill();
+}
+
+function drawMoon() {
+  const cx = W/2, cy = H*0.10;
+  const r = Math.min(W,H)*0.09;
+
+  const glow = ctx.createRadialGradient(cx, cy, r*0.8, cx, cy, r*2);
+  glow.addColorStop(0, 'rgba(220,220,180,0.15)'); glow.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.beginPath(); ctx.arc(cx, cy, r*2, 0, Math.PI*2); ctx.fillStyle = glow; ctx.fill();
+
+  const grad = ctx.createRadialGradient(cx-r*.2, cy-r*.2, r*.05, cx, cy, r);
+  grad.addColorStop(0, '#e8e4d0'); grad.addColorStop(0.5, '#c8c4aa'); grad.addColorStop(1, '#888070');
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.fillStyle = grad; ctx.fill();
+
+  ctx.save();
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.clip();
+  for (const [bx,by,br] of [
+    [cx-r*.3,cy+r*.2,r*.12],[cx+r*.3,cy-r*.1,r*.09],
+    [cx-r*.1,cy-r*.3,r*.07],[cx+r*.1,cy+r*.35,r*.06],[cx+r*.4,cy+r*.3,r*.05]
+  ]) {
+    const cg = ctx.createRadialGradient(bx,by,0,bx,by,br);
+    cg.addColorStop(0,'rgba(100,95,80,0.7)'); cg.addColorStop(0.7,'rgba(120,115,95,0.3)');
+    cg.addColorStop(1,'rgba(200,195,170,0.0)');
+    ctx.beginPath(); ctx.arc(bx,by,br,0,Math.PI*2); ctx.fillStyle=cg; ctx.fill();
+  }
+  ctx.restore();
+
+  // Flag on Moon (once visited, stays forever)
+  if (sim.moonVisited) {
+    ctx.save();
+    ctx.translate(cx + r*0.15, cy + r*0.88);
+    ctx.strokeStyle = '#ccc'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(0,-14); ctx.stroke();
+    ctx.fillStyle = '#ffcc00'; ctx.fillRect(0,-14,9,6);
+    ctx.fillStyle = '#003388'; ctx.font = 'bold 4px Arial';
+    ctx.fillText('TH', 1, -10);
+    ctx.restore();
+  }
+}
+
+function drawRocket() {
+  const pos = getRocketScreenPos();
+  const { x: cx, y: ry, w: rw, h: rh } = pos;
+  const rotation = sim.direction === -1 ? Math.PI : 0;
+
+  ctx.save();
+  ctx.translate(cx, ry + rh/2);
+  ctx.rotate(rotation);
+
+  // Particles (drawn in world space, unrotated)
+  ctx.save();
+  ctx.rotate(-rotation);
+  for (const p of sim.particles) {
+    ctx.globalAlpha = p.life * 0.8;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x - cx, p.y - (ry + rh/2), p.size, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  // Engine flame (always at bottom in local space → rotated correctly)
+  if (sim.thrustOn) {
+    const fl = rh * 0.7 * (0.8 + 0.4 * Math.random());
+    const fg = ctx.createLinearGradient(0, rh*.5, 0, rh*.5+fl);
+    fg.addColorStop(0,'rgba(255,255,200,1)'); fg.addColorStop(0.3,'rgba(255,140,0,0.9)');
+    fg.addColorStop(0.7,'rgba(255,50,0,0.6)'); fg.addColorStop(1,'rgba(255,0,0,0)');
+    ctx.beginPath();
+    ctx.moveTo(-rw*.3, rh*.5);
+    ctx.quadraticCurveTo(-rw*.6, rh*.5+fl*.5, 0, rh*.5+fl);
+    ctx.quadraticCurveTo(rw*.6, rh*.5+fl*.5, rw*.3, rh*.5);
+    ctx.fillStyle = fg; ctx.fill();
+    const fl2 = fl*0.5;
+    const ig = ctx.createLinearGradient(0, rh*.5, 0, rh*.5+fl2);
+    ig.addColorStop(0,'rgba(255,255,255,1)'); ig.addColorStop(1,'rgba(255,220,100,0)');
+    ctx.beginPath();
+    ctx.moveTo(-rw*.15, rh*.5);
+    ctx.quadraticCurveTo(-rw*.2, rh*.5+fl2*.5, 0, rh*.5+fl2);
+    ctx.quadraticCurveTo(rw*.2, rh*.5+fl2*.5, rw*.15, rh*.5);
+    ctx.fillStyle = ig; ctx.fill();
+  }
+
+  // Body
+  const bg = ctx.createLinearGradient(-rw/2, 0, rw/2, 0);
+  bg.addColorStop(0,'#aaa'); bg.addColorStop(0.3,'#fff');
+  bg.addColorStop(0.7,'#ddd'); bg.addColorStop(1,'#888');
+  ctx.fillStyle = bg;
+  ctx.beginPath(); ctx.roundRect(-rw/2,-rh*.35,rw,rh*.7,4); ctx.fill();
+
+  // Nose cone
+  ctx.fillStyle = '#cc2222';
+  ctx.beginPath(); ctx.moveTo(0,-rh*.5); ctx.lineTo(-rw*.5,-rh*.18); ctx.lineTo(rw*.5,-rh*.18); ctx.closePath(); ctx.fill();
+
+  // Window
+  ctx.fillStyle = '#88ddff'; ctx.strokeStyle = '#555'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(0,-rh*.08,rw*.18,0,Math.PI*2); ctx.fill(); ctx.stroke();
+
+  // Fins
+  ctx.fillStyle = '#cc2222';
+  ctx.beginPath(); ctx.moveTo(-rw*.5,rh*.2); ctx.lineTo(-rw*1.1,rh*.5); ctx.lineTo(-rw*.5,rh*.5); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(rw*.5,rh*.2); ctx.lineTo(rw*1.1,rh*.5); ctx.lineTo(rw*.5,rh*.5); ctx.closePath(); ctx.fill();
+
+  // Nozzle
+  ctx.fillStyle = '#777';
+  ctx.beginPath(); ctx.moveTo(-rw*.3,rh*.35); ctx.lineTo(rw*.3,rh*.35); ctx.lineTo(rw*.4,rh*.5); ctx.lineTo(-rw*.4,rh*.5); ctx.closePath(); ctx.fill();
+
+  // Flag stripe
+  ctx.fillStyle = 'rgba(0,80,255,0.7)';
+  ctx.fillRect(-rw*.5, rh*.05, rw, rh*.06);
+
+  ctx.restore();
+}
+
+function drawLaunchPad() {
+  const nearEarth = sim.phase === 'ready' || sim.altKm < 200;
+  if (!nearEarth) return;
+  const alpha = sim.phase === 'ready' ? 1 : Math.max(0, 1 - sim.altKm/200);
+  ctx.globalAlpha = alpha;
+  const cx = W/2, gy = H*0.83;
+  ctx.fillStyle = '#555'; ctx.fillRect(cx-50, gy-8, 100, 8);
+  ctx.fillStyle = '#444'; ctx.fillRect(cx-8, gy-60, 16, 60);
+  ctx.strokeStyle = '#666'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(cx-25,gy-50); ctx.lineTo(cx-60,gy-8); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx+25,gy-50); ctx.lineTo(cx+60,gy-8); ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
+function drawProgressLine() {
+  const progress = Math.min(sim.altKm / MOON_DIST_KM, 1);
+  const sy = H*0.82, ey = H*0.14, x = W*0.08;
+
+  ctx.strokeStyle = 'rgba(0,255,136,0.15)'; ctx.lineWidth = 2;
+  ctx.setLineDash([6,6]);
+  ctx.beginPath(); ctx.moveTo(x,sy); ctx.lineTo(x,ey); ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.strokeStyle = 'rgba(0,255,136,0.5)'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(x,sy); ctx.lineTo(x, sy-(sy-ey)*progress); ctx.stroke();
+
+  const dotY = sy - (sy-ey)*progress;
+  ctx.fillStyle = '#00ff88';
+  ctx.beginPath(); ctx.arc(x, dotY, 4, 0, Math.PI*2); ctx.fill();
+
+  ctx.fillStyle = 'rgba(0,255,136,0.4)';
+  ctx.font = '10px Courier New'; ctx.textAlign = 'center';
+  ctx.fillText('EARTH', x, sy+14);
+  ctx.fillText('MOON', x, ey-8);
+}
+
+// --- Main loop ---
+let lastTimestamp = null;
+function loop(ts) {
+  if (!lastTimestamp) lastTimestamp = ts;
+  const dt = Math.min((ts - lastTimestamp)/1000, 0.05);
+  lastTimestamp = ts;
+
+  sim.earthRotation += dt * 0.03;
+  sim.moonRotation  += dt * 0.01;
+  sim.orbitPhase    += dt * 0.5;
+
+  stepPhysics(dt);
+  updatePhaseText();
+  const active = !['ready','failed'].includes(sim.phase);
+  if (active) updateMissionTime();
+
+  drawBackground();
+  drawStars(ts/1000);
+  drawMoon();
+  drawEarth();
+  drawLaunchPad();
+  drawProgressLine();
+  drawRocket();
+
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// --- Countdown helper ---
+let countdownActive = false;
+function startCountdown(onDone) {
+  countdownActive = true;
+  let n = 5;
+  showMessage('T-' + n);
+  const iv = setInterval(() => {
+    n--;
+    if (n > 0) { showMessage('T-' + n); }
+    else { clearInterval(iv); hideMessage(); countdownActive = false; onDone(); }
+  }, 1000);
+}
+
+// --- Controls ---
+document.getElementById('btn-launch').addEventListener('click', () => {
+  if (sim.phase !== 'ready' || countdownActive) return;
+  document.getElementById('btn-launch').disabled = true;
+  startCountdown(() => {
+    sim.phase = 'launch';
+    setPhaseText('MAIN ENGINE START');
+  });
+});
+
+document.getElementById('btn-return').addEventListener('click', () => {
+  if (sim.phase !== 'landed' || countdownActive) return;
+  document.getElementById('btn-return').disabled = true;
+  hideMessage();
+  startCountdown(() => {
+    sim.direction = -1;
+    sim.velMs = 0;
+    sim.phase = 'return_launch';
+    setPhaseText('RETURN LAUNCH');
+  });
+});
+
+document.getElementById('btn-reset').addEventListener('click', resetSim);
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space' && sim.phase === 'ready' && !countdownActive) {
+    document.getElementById('btn-launch').click();
+  }
+  if (e.code === 'KeyR') resetSim();
+});
+</script>
+</body>
+</html>
